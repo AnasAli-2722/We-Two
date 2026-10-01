@@ -1,0 +1,368 @@
+We Two — App Functionality Overview & Next Steps
+Date: 2026-04-07
+
+============================================================
+1) WHAT THE APP CURRENTLY DOES
+============================================================
+
+A) App startup and backend connection
+- On launch, the app loads env vars from .env:
+  - SUPABASE_URL
+  - SUPABASE_ANON_KEY
+- If missing, startup throws a clear exception.
+- Supabase is initialized before the app UI starts.
+
+B) Authentication flow
+- Auth screen supports:
+  - Login (email + password)
+  - Sign up (email + password + username)
+- Sign-up sends username through metadata so backend trigger can create profile data.
+- Auth errors are mapped to user-friendly messages (invalid credentials, email not confirmed, etc.).
+
+C) Mandatory profile setup gate
+- After authentication, app checks profile completeness.
+- If first_name is missing/empty, user is forced to /profile_setup.
+- Profile setup includes:
+  - Avatar pick from gallery
+  - First name (required)
+  - Last name (optional)
+  - Birthday picker
+- On submit:
+  - Optional avatar upload to Supabase Storage bucket `avatars`
+  - Profile data upsert in `profiles`
+  - Auth gate refresh
+  - Redirect to /chat when profile is complete
+
+D) Main chat entry behavior
+- /chat now opens FindPartnerScreen (entry controller).
+- If user has no active partner, app shows:
+  - “add people to start chatting”
+  - “Find People” button to open discovery
+- If active partner exists, app opens the direct chat screen.
+
+E) Direct chat behavior
+- Real-time message stream shown for the active duo.
+- Input field sends message to `messages` table.
+- Send button has loading state and guarded execution.
+- If sending fails, snackbar feedback is shown.
+- Contact switching is still available through contacts sheet.
+
+F) People & Discovery feature
+- Discovery screen includes:
+  - Search input (fuzzy, case-insensitive): ilike('username', '%query%')
+  - Requests button with red badge (unseen requests)
+  - Result cards with avatar, username, and person_add action
+- Request bottom sheet shows pending requests with:
+  - Accept
+  - Decline
+
+G) Request handling
+- Sending request uses RPC: send_partner_request.
+- Responding to request now uses:
+  1) Preferred RPC path: respond_partner_request (if exists)
+  2) Fallback client-side transactional-ish updates:
+     - validate ownership
+     - update request status
+     - on accept: set active_partner_id for both users
+
+H) Routing and guards
+- Route behavior:
+  - /setup if backend config is unavailable
+  - /auth when unauthenticated
+  - /profile_setup when profile incomplete
+  - /chat when authenticated and profile complete
+  - /discovery for people search and requests
+
+============================================================
+2) HOW TO USE THE APP (CURRENT USER JOURNEY)
+============================================================
+
+1. Add SUPABASE_URL and SUPABASE_ANON_KEY in .env.
+2. Launch app.
+3. Sign up or log in.
+4. If prompted, complete profile setup.
+5. Land on /chat:
+   - If no active duo: tap “Find People”
+   - Search users by username
+   - Send request
+6. Open Requests modal and accept a request.
+7. Duo becomes active; app enters direct chat screen.
+8. Exchange messages in real time.
+
+============================================================
+3) CURRENT ARCHITECTURE SNAPSHOT
+============================================================
+
+Core
+- Env and Supabase bootstrap in main.dart
+- Global providers in core/providers.dart
+
+Features
+- auth/
+  - repository + auth state providers + auth screen
+- profiles/
+  - profile model + repository + profile setup screen
+- people/
+  - discovery models, repository, notifiers, app bar, discovery UI, requests modal, find partner entry screen
+- chat/
+  - duo state, message stream provider, chat repository, chat UI
+
+State Management
+- flutter_riverpod providers and notifiers
+- async gate provider for route decisions
+
+Backend
+- Supabase Auth, Postgres tables, Storage bucket avatars
+- RPC used for request creation, optional RPC used for request response
+
+============================================================
+4) KNOWN LIMITATIONS / RISKS RIGHT NOW
+============================================================
+
+1. Message stream filtering still relies on client-side filtering from a full stream.
+   - This can become costly and should be moved server-side with strict RLS and/or RPC.
+
+2. Contact source depends on accepted requests + active partner.
+   - Good improvement, but should be fully normalized around one relationship source of truth.
+
+3. Request response fallback path is not fully atomic.
+   - Preferred production path is a single DB RPC transaction.
+
+4. Discovery currently assumes table/columns:
+   - partner_requests(status, is_seen, from_user_id, to_user_id, created_at)
+   - If schema differs, behavior may degrade.
+
+5. Chat header still surfaces partner ID in some paths.
+   - Should use display name/avatar from profile.
+
+============================================================
+5) WHAT TO FOCUS ON NEXT (PRIORITY ORDER)
+============================================================
+
+P0 (must do before launch)
+1. Implement and enforce atomic backend RPC for accept/decline logic.
+   - Ensure both relationship status and active_partner_id updates happen in one transaction.
+
+2. Move message query/filter to secure server-side approach.
+   - Tight RLS + scoped query/view/RPC for duo messages only.
+
+3. Add robust error telemetry/logging.
+   - Capture Supabase failures and route issues for production diagnostics.
+
+P1 (high-impact polish)
+4. Replace partner UUID display with real partner profile (name + avatar) in chat header.
+5. Add settings/account area (at least sign out + profile edit).
+6. Improve UX transitions and feedback consistency (success/failure toasts, disabled controls).
+
+P2 (quality and scale)
+7. Add integration tests for:
+   - auth gate redirects
+   - profile setup completion redirect
+   - request accept leading to active duo
+   - chat send failure/success
+8. Add offline/retry handling strategy for message send and request actions.
+
+============================================================
+6) SUGGESTED LAUNCH CHECKLIST
+============================================================
+
+- [ ] Env setup documented and validated
+- [ ] RLS policies reviewed (profiles/messages/requests/storage)
+- [ ] RPCs finalized (send/respond request)
+- [ ] Atomic accept flow confirmed
+- [ ] Chat stream secured/scoped
+- [ ] Crash/error monitoring integrated
+- [ ] UX pass complete (copy, feedback, empty states)
+- [ ] Integration tests passing
+- [ ] README and deployment notes updated
+
+============================================================
+7) QUICK TECHNICAL NOTES
+============================================================
+
+- If you see request/duo inconsistency, verify RPC `respond_partner_request` exists and matches params:
+  - p_request_id
+  - p_accept
+  - p_current_user_id
+
+- If users cannot discover each other, verify profiles.username values and RLS on profiles select.
+
+- If avatar upload fails, verify bucket name `avatars` and storage policies.
+
+- If profile setup loops, confirm first_name persists in `profiles` row for current auth user ID.
+
+============================================================
+End of overview.
+
+
+============================================================
+8) MASTER PLAN IMPLEMENTATION PROGRESS
+============================================================
+
+Status: IN PROGRESS (M1 started)
+
+Completed in this iteration:
+- Added centralized error reporting utility:
+  - lib/core/app_error_reporter.dart
+- Wired error reporting into key flows:
+  - auth sign-in/sign-up failures
+  - request send/respond failures
+  - profile completion failures
+- Hardened request response path:
+  - tries backend RPC `respond_partner_request` first
+  - reports RPC failures with context
+  - keeps fallback logic for compatibility until RPC is guaranteed in all envs
+
+Files touched in this milestone:
+- lib/core/app_error_reporter.dart
+- lib/features/auth/data/auth_repository.dart
+- lib/features/people/data/people_repository.dart
+- lib/features/people/application/discovery_notifier.dart
+- lib/features/profiles/presentation/profile_setup_screen.dart
+
+What is next (immediate):
+1) Make request response strictly RPC-only once DB function is confirmed stable.
+2) Add server-scoped chat retrieval (replace broad realtime stream pattern).
+3) Add route-level and flow-level integration tests for launch-critical journeys.
+
+
+============================================================
+9) V1.1 FEATURE EXPANSION STATUS (UPDATED 2026-04-08)
+============================================================
+
+Current status: PHASES 1–6 IMPLEMENTED (with runtime hardening in progress)
+
+Delivered:
+- Phase 1 (Schema prep artifacts):
+  - SQL artifact created for:
+    - messages.reply_to_id (nullable UUID FK to messages.id)
+    - profiles.fcm_token (nullable text)
+  - Note: some environments still need this SQL applied.
+
+- Phase 2 (Global shell navigation):
+  - Stateful shell routing with bottom tabs:
+    - Chat
+    - Discovery
+    - Profile
+
+- Phase 3 (Discovery + duo switching refactor):
+  - Discovery owns search and request handling.
+  - Chat top-right action opens modal bottom sheet only.
+  - Friends list source switched to accepted partner relationships.
+
+- Phase 4 (Chat header + inversion):
+  - Header now resolves partner profile name/avatar (UUID display removed).
+  - Message list inversion corrected using:
+    - reverse: true in UI
+    - created_at descending stream order
+
+- Phase 5 (Swipe-to-reply):
+  - Reply gesture added using flutter_slidable.
+  - Composer shows “Replying to …” state.
+  - Sent messages include optional reply_to_id.
+  - Message bubble renders reply preview snippet.
+
+- Phase 6 (In-app notifications prep):
+  - Local notifications integrated for foreground heads-up alerts.
+  - Realtime listeners added for:
+    - pending partner requests to current user
+    - new messages from current active partner
+  - Notification tap routes user to /chat.
+  - Firebase Messaging token sync wired to profiles.fcm_token (guarded).
+
+Stability status:
+- App compile errors fixed.
+- Widget smoke test passing.
+
+Open follow-ups:
+1) Apply Phase 1 SQL in all Supabase environments where columns are missing.
+2) Add full Firebase initialization/config files per platform for production push.
+3) Add integration tests for:
+   - swipe-to-reply send payload
+   - notification tap navigation
+   - discovery/request/accept-to-chat flow
+
+
+============================================================
+10) NOTIFICATIONS E2E AUDIT + RELEASE HARDENING (UPDATED 2026-04-08)
+============================================================
+
+Status: IMPLEMENTED + VERIFIED IN CODEBASE
+
+What was completed:
+
+A) Supabase push function notes
+- Edge function notes removed for fresh reimplementation.
+
+B) Flutter background notification entrypoint corrected
+- File: lib/features/notifications/notification_service.dart
+- Added/kept top-level isolate-safe handler:
+  - @pragma('vm:entry-point')
+  - Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message)
+- Handler behavior:
+  - initializes Firebase if needed
+  - initializes FlutterLocalNotificationsPlugin
+  - creates high-importance Android channel
+  - extracts title/body from message.data
+  - always calls localNotifications.show(...) for background delivery
+- No UI layer / router / Riverpod dependency inside handler.
+
+C) Foreground guard logic fixed (silence only for active chat sender)
+- Files:
+  - lib/features/notifications/notification_service.dart
+  - lib/features/notifications/application/in_app_notifications_provider.dart
+- Active partner source wired from Riverpod duo state into NotificationService getter.
+- Guard logic now:
+  - prints: Checking Guard: Sender(...) vs Active(...)
+  - if sender_id == activePartnerId -> return (silence)
+  - if activePartnerId is null/empty -> show notification
+  - if sender_id != activePartnerId -> show notification
+- Added foreground debugging logs for incoming message.data and show/silence decisions.
+
+D) Android release configuration hardened for push behavior
+- File: android/app/src/main/AndroidManifest.xml
+  - Added metadata:
+    - com.google.firebase.messaging.default_notification_channel_id
+  - Added messaging service intent filter:
+    - com.google.firebase.MESSAGING_EVENT
+
+- File: android/app/src/main/res/values/strings.xml
+  - Added:
+    - default_notification_channel_id = high_importance_channel
+
+- File: android/app/build.gradle.kts
+  - Release build now enables shrink/minify with explicit proguard file wiring:
+    - isMinifyEnabled = true
+    - isShrinkResources = true
+    - proguardFiles(..., "proguard-rules.pro")
+
+- File: android/app/proguard-rules.pro
+  - Added keep rules for:
+    - Firebase / Google Play services classes
+    - Flutter embedding/plugin registrant classes
+    - firebase messaging plugin classes
+
+E) Channel importance confirmation
+- Android channel ID standardized to: high_importance_channel
+- Notification priority/importance confirmed in local notifications:
+  - importance: Importance.max
+  - priority: Priority.high
+
+Current notification behavior summary:
+- Foreground:
+  - suppress only when message sender matches currently active partner chat
+  - show for all other senders or when no active chat partner
+- Background:
+  - always show local notification for data-only FCM payloads
+
+Release readiness notes:
+- Analyzer checks for touched notification/android files are clean.
+
+Remaining recommended validation before final APK shipping:
+1) Physical device test matrix:
+   - app open on active chat (should silence matching sender)
+   - app open on home/discovery (should show)
+   - app backgrounded (should show)
+2) Verify Android 13+ runtime notification permission granted on fresh install.
+3) Confirm production signing config replaces debug signing in release build.
+

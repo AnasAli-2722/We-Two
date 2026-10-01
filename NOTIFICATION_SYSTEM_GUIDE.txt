@@ -1,0 +1,374 @@
+WE TWO NOTIFICATION SYSTEM GUIDE
+
+Purpose
+
+This file explains the current notification architecture in the app, how it works end to end,
+which files control each step, and what to check when debugging notification issues.
+
+High-level summary
+
+The app uses a data-only notification setup:
+
+1. Firebase Cloud Messaging (FCM) delivers silent data payloads.
+2. flutter_local_notifications is used to render notifications inside the app when needed.
+3. Supabase stores the recipient FCM token in profiles.fcm_token.
+4. A Supabase Edge Function, send-fcm, decides when to send a push and calls FCM v1.
+5. The chat screen suppresses duplicate notifications when the active conversation is already open.
+
+Main files involved
+
+Client side
+
+- lib/main.dart
+- lib/app/app.dart
+- lib/features/notifications/application/in_app_notifications_provider.dart
+- lib/features/notifications/notification_service.dart
+- lib/features/chat/presentation/chat_screen.dart
+- lib/features/profiles/data/profile_repository.dart
+- lib/features/profiles/presentation/settings_screen.dart
+
+Backend side
+
+- supabase/functions/send-fcm/index.ts
+- supabase/config.toml
+- database/phase1_schema_expansion.sql
+
+Android platform config
+
+- android/app/src/main/AndroidManifest.xml
+- android/app/src/main/res/values/strings.xml
+
+End-to-end flow
+
+1. App startup
+
+The app boots in lib/main.dart.
+
+- Flutter bindings are initialized.
+- .env is loaded.
+- Firebase.initializeApp() runs before the app widget tree starts.
+- Supabase.initialize() also runs here.
+
+This matters because the notification service also checks Firebase.apps and will initialize Firebase again if needed.
+
+2. Notification bootstrap is activated by the app root
+
+lib/app/app.dart watches inAppNotificationsBootstrapProvider.
+
+That provider is the entry point that wires notifications into the running app.
+
+What it does:
+
+- Reads the current authenticated user id.
+- Reads the current active chat partner id.
+- Creates NotificationService through notificationServiceProvider.
+- Calls, in order:
+  - initializeMessagingCore()
+  - requestAllPermissions()
+  - syncTokenForUser(userId)
+  - startTokenRefreshSync(userId)
+  - startRealtimeInAppNotifications(userId, activePartnerId)
+
+Because this provider is watched from the root widget, the notification setup starts as soon as the app has a logged-in user.
+
+3. Permission and token setup
+
+The core permission and registration logic lives in
+lib/features/notifications/notification_service.dart.
+
+requestAllPermissions() currently requests:
+
+- FCM permission through FirebaseMessaging.instance.requestPermission()
+- Android notification permission through permission_handler
+- Android exact alarm permission
+- Ignore battery optimization permission
+
+Important note:
+
+- The battery optimization request is advisory and may not always be granted.
+- Android 13+ notification permission is a separate runtime gate.
+- If permission is denied, push notifications may still be received by FCM, but the device may not show them.
+
+After permissions, the service gets the current FCM token with FirebaseMessaging.instance.getToken() and stores it in Supabase.
+
+Token storage:
+
+- Table: profiles
+- Column: fcm_token
+- Writer: NotificationService.syncTokenForUser()
+- Also refreshed by startTokenRefreshSync() when FCM rotates the token
+
+The profile repository also has updateFcmToken(), but the notification flow currently uses NotificationService directly.
+
+4. Local notification engine initialization
+
+initializeMessagingCore() does the local setup for both FCM and flutter_local_notifications.
+
+It performs these steps:
+
+- Ensures Firebase is initialized.
+- Registers the background handler with FirebaseMessaging.onBackgroundMessage().
+- Initializes flutter_local_notifications.
+- Sets the tap callback so a notification tap calls onNotificationTap(payload).
+- Stores a clear-all callback so the service can dismiss displayed notifications later.
+- Requests Android notification permission from the local-notifications plugin.
+- Creates the Android notification channel.
+
+The channel values are fixed:
+
+- ID: high_importance_channel
+- Name: High Importance Notifications
+- Description: Partner requests and active chat messages
+
+The Android manifest also maps the default notification channel id to the same channel string.
+
+5. Foreground FCM behavior
+
+When a remote message arrives while the app is running, FirebaseMessaging.onMessage is handled in NotificationService.initializeMessagingCore().
+
+The logic is:
+
+- Read message.data.
+- Extract title, body, type, and sender_id from message.data only.
+- Compare sender_id with the globally tracked active chat id after converting both values to String.
+
+Special suppression rule:
+
+- If the message is type chat_message and sender_id matches the active chat partner id, the app does not show a local notification.
+- Instead it increments forceRefreshTrigger and clears displayed notifications immediately.
+- This is how the chat screen refreshes itself without showing a redundant banner.
+
+If the message does not match that suppression rule, showForegroundNotification() builds a local notification from the message and displays it.
+
+6. Background and terminated-state behavior
+
+Background FCM messages are handled by _firebaseMessagingBackgroundHandler().
+
+Current behavior:
+
+- Ensures Firebase is initialized.
+- Logs the background message.
+- Does not build custom UI there.
+
+Important note:
+
+- Because the payload is data-only, Android should no longer auto-display the push from the OS notification tray.
+- The app is now responsible for showing and clearing notifications through flutter_local_notifications.
+
+7. Notification tap behavior
+
+There are three tap paths:
+
+- flutter_local_notifications tap callback
+- FirebaseMessaging.onMessageOpenedApp
+- FirebaseMessaging.instance.getInitialMessage() for launch-from-notification
+
+All of them eventually call the same tap handler.
+
+Current routing behavior:
+
+- The payload currently resolves to /chat for chat_message, new_request, and request_accepted.
+- onNotificationTap('/chat') pushes the user to the chat route.
+
+Important note:
+
+- This means all current notification types route into chat, even though the notification text differs.
+
+8. Realtime in-app subscription for partner requests
+
+startRealtimeInAppNotifications() creates a Supabase stream on partner_requests.
+
+Current design intent:
+
+- It does not show a popup locally from the stream.
+- The comment says partner request alerts are delivered by FCM mixed payload to avoid duplicate notifications across foreground and background.
+
+So the realtime stream is mostly a support hook or future expansion point, not the primary popup mechanism.
+
+9. Chat screen integration
+
+lib/features/chat/presentation/chat_screen.dart is the main consumer of the notification state.
+
+What it does:
+
+- Registers a listener on NotificationService.forceRefreshTrigger in initState().
+- Invalidates messageStreamProvider when that trigger changes.
+- Invalidates the message stream again when the app resumes.
+- Calls NotificationService.setActiveChatId(duoState?.activePartnerId) during build.
+- Calls NotificationService.clearActiveChat() in dispose().
+
+Why this matters:
+
+- The notification service needs to know which chat is open.
+- That active chat id is the key part of the duplicate-notification suppression logic.
+- If the user is already inside the matching conversation, the foreground message can refresh the UI instead of creating a banner.
+
+Important implementation detail:
+
+- The comparison is done against the active partner id, not a message id.
+- If sender_id in the incoming message data does not match the active partner id exactly, the suppression rule will not fire.
+
+10. How tokens are written and used
+
+The app writes the current FCM token into profiles.fcm_token.
+
+This token is then read by the Supabase Edge Function send-fcm before sending a push.
+
+If the token is missing:
+
+- The edge function returns a skipped response.
+- No push is sent.
+
+If the token changes:
+
+- onTokenRefresh writes the new token back to the database.
+
+Backend notification sender
+
+The Edge Function at supabase/functions/send-fcm/index.ts is the push sender.
+
+Its job is:
+
+1. Read an event payload.
+2. Decide whether the event should create a notification.
+3. Resolve the recipient FCM token from profiles.
+4. Build a Firebase access token from the service account JSON.
+5. Send the notification to FCM v1.
+
+Notification types handled by the function:
+
+- chat_message
+- new_request
+- request_accepted
+
+The function supports these sources:
+
+- messages insert -> chat_message
+- partner_requests insert with status pending -> new_request
+- partner_requests update to accepted -> request_accepted
+
+It also supports friend_requests as an alternate request table name.
+
+Payload fields expected by the function:
+
+- messages rows should contain sender_id, receiver_id, id, and content or message_text
+- request rows should contain from_user_id or sender_id, to_user_id or receiver_id, id, and status
+
+The function builds a Firebase message with:
+
+- data.title
+- data.body
+- data.type
+- data.sender_id
+- data.item_id
+- android.priority = high
+
+Important change:
+
+- The notification block has been removed.
+- This makes the payload data-only so Android does not auto-display the system tray notification.
+
+The function can also be protected by an x-webhook-secret header if FCM_WEBHOOK_SECRET is configured.
+
+Critical backend note:
+
+- The edge function does not send notifications for every database change.
+- It only sends when buildNotificationIntent() recognizes the event and transition.
+- If the payload schema changes, notification delivery can silently stop because the function returns skipped.
+
+Schema and platform prerequisites
+
+Database fields added for notifications:
+
+- profiles.fcm_token
+- messages.reply_to_id is unrelated to notifications but lives in the same schema expansion file
+
+Android requirements present in the manifest:
+
+- android.permission.POST_NOTIFICATIONS
+- android.permission.VIBRATE
+- android.permission.RECEIVE_BOOT_COMPLETED
+- android.permission.SCHEDULE_EXACT_ALARM
+- android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+
+Android channel config:
+
+- default_notification_channel_id is set to high_importance_channel
+
+Useful code notes and caveats
+
+- NotificationService.showMessageNotification() and showPartnerRequestNotification() exist, but they are not the main current delivery path.
+- The main visible push path is now FCM data-only -> app code -> local notification display.
+- The settings screen has a Push Notifications toggle, but it is currently only UI state. It does not persist into the notification service or the backend.
+- The current onNotificationTap behavior always routes to /chat.
+- The background handler logs messages but does not create custom Flutter UI.
+- clearAllNotifications() is the public tray reset method.
+- _clearDisplayedNotifications is only assigned after initializeMessagingCore() runs.
+
+What to check first when debugging
+
+1. Is the user logged in?
+
+- Without an authenticated user, the bootstrap provider returns early.
+- No token sync and no notification subscription setup will happen.
+
+2. Is Firebase initialized?
+
+- main.dart initializes it before runApp.
+- NotificationService also guards against missing Firebase.apps.
+
+3. Is the FCM token present in profiles.fcm_token?
+
+- If empty, the push sender has nowhere to send.
+- Check syncTokenForUser() and onTokenRefresh.
+
+4. Is the edge function receiving the expected payload?
+
+- Check whether payload.type, payload.table, and the record fields match the current code.
+- If the event is not recognized, the function returns skipped.
+
+5. Is the notification permission granted on the device?
+
+- Android 13+ needs runtime notification permission.
+- iOS/macOS also need permission approval.
+
+6. Is the active chat suppressing the notification?
+
+- If the open chat partner matches sender_id, foreground notification display is skipped.
+- The UI may still refresh without showing a banner.
+
+7. Is the notification channel correct on Android?
+
+- The channel id must remain high_importance_channel.
+- If the channel is changed, Android may not show notifications as expected.
+
+8. Is the backend token lookup failing?
+
+- The edge function reads profiles.fcm_token for the recipient.
+- If that query fails or the token is missing, the function acknowledges the event but sends nothing.
+
+9. Are you testing a request event or a chat message event?
+
+- chat_message is handled differently from new_request and request_accepted.
+- Make sure the source table and status transitions match the function rules.
+
+10. Are duplicates happening?
+
+- Check whether the same event is being handled by both FCM and local notification code.
+- The current design tries to avoid duplicates by suppressing local popups when the active chat is already open.
+
+Practical debug checklist
+
+- Confirm the user id in authUserIdProvider is not null.
+- Confirm profiles.fcm_token is populated for that user.
+- Confirm the edge function log shows a matched intent, not a skipped event.
+- Confirm the notification permission prompt was granted on the device.
+- Confirm the app channel id is still high_importance_channel.
+- Confirm the active chat id matches the sender_id for in-chat suppression tests.
+- Confirm the tap route is /chat and the router can handle it.
+
+Current architecture in one sentence
+
+Supabase records the event, send-fcm turns the event into an FCM data-only push, Firebase delivers it silently, and the Flutter app decides whether to show or suppress a local notification based on the active chat.
+
+End of file

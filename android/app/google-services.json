@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "295958143475",
+    "project_id": "wifeysappv2",
+    "storage_bucket": "wifeysappv2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:295958143475:android:584c08c248e70ed552b286",
+        "android_client_info": {
+          "package_name": "com.example.we_two"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAQIYv47UqWnBcvfpLkN6N6i12jyYjFDDo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
